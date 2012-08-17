@@ -30,6 +30,7 @@
 __version__ = (0, 0, 0, "dev", 0)
 
 from kountry import Country
+from kountry import classproperty
 from collections import OrderedDict
 
 
@@ -66,7 +67,7 @@ class Currency(object):
     def __repr__(self):
         return self.name
 
-    @classmethod
+    @classproperty
     def codes(cls):
         """
         Returns all existing currency codes.
