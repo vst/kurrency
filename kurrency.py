@@ -302,6 +302,9 @@ class ExchangeRate(object):
 
         TODO: Avoid repetitive imports of plugins:
         """
+        cur1 = Currency.get(cur1) if isinstance(cur1, str) else cur1
+        cur2 = Currency.get(cur2) if isinstance(cur2, str) else cur2
+
         # Create the argument array:
         kwargs = {"cur1": cur1,
                   "cur2": cur2,
@@ -326,7 +329,8 @@ class ExchangeRate(object):
             cls, method = ccallable.split("#")
             return getattr(getattr(__import__(module), cls), method)
         except ValueError:
-            return getattr(__import__(module), ccallable)
+            hep = __import__(module, fromlist=[ccallable])
+            return getattr(hep, ccallable)
 
     @classmethod
     def add_plugin(cls, plugin):
