@@ -29,10 +29,15 @@
 
 __version__ = (0, 0, 0, "dev", 0)
 
+from collections import OrderedDict
+from decimal import Decimal
 from kountry import Country
 from kountry import classproperty
-from collections import OrderedDict
-
+from textwrap import wrap
+import csv
+import datetime
+import json
+import re
 
 class Currency(object):
     """
@@ -45,27 +50,64 @@ class Currency(object):
     Provides a lookup table mainly for :attr:`get` class method.
     """
 
+    FIELD_NAMES = ["code", "enum", "name", "common_name", "short_name",
+                   "nickname", "symbol", "short_symbol", "decimal_points",
+                   "used_in"]
+    """
+    Provides the field names for the currency model.
+    """
+
     DB = OrderedDict()
     """
     Provides the currency database as an ordered dictionary.
     """
 
     def __init__(self, code, enum, name, common_name, short_name, nickname,
-                 symbol, short_symbol, decimal_points, countries):
+                 symbol, short_symbol, decimal_points, used_in):
         # Save object attributes:
-        self.code = code
-        self.enum = enum
-        self.name = name
+        self.code = str(code)
+        self.enum = ("%03d" % (int(enum))) if (enum != None and enum != "None") else None
+        self.name = str(name)
         self.common_name = common_name
         self.short_name = short_name
         self.nickname = nickname
         self.symbol = symbol
         self.short_symbol = short_symbol
-        self.decimal_points = decimal_points
-        self.countries = countries
+        self.decimal_points = int(decimal_points) if decimal_points else None
+        self.used_in = used_in
 
     def __repr__(self):
         return self.name
+
+    def to_dict(self):
+        """
+        Returns a dictionary version of the currency object.
+        """
+        return dict(code=self.code,
+                    enum=self.enum,
+                    name=self.name,
+                    common_name=self.common_name,
+                    short_name=self.short_name,
+                    nickname=self.nickname,
+                    symbol=self.symbol,
+                    short_symbol=self.short_symbol,
+                    decimal_points=self.decimal_points,
+                    used_in=self.used_in)
+
+    def to_simple_dict(self):
+        """
+        Returns a dictionary version of the currency object.
+        """
+        return dict(code=self.code,
+                    enum=self.enum,
+                    name=self.name,
+                    common_name=self.common_name,
+                    short_name=self.short_name,
+                    nickname=self.nickname,
+                    symbol=self.symbol,
+                    short_symbol=self.short_symbol,
+                    decimal_points=self.decimal_points,
+                    used_in=[item.code_2 for item in self.used_in])
 
     @classproperty
     def codes(cls):
@@ -73,6 +115,14 @@ class Currency(object):
         Returns all existing currency codes.
         """
         return cls.DB.keys()
+
+    @classproperty
+    def dictdb(cls):
+        """
+        Produces a dictionary version of all of the currencies in the
+        database.
+        """
+        return [currency.to_dict() for key, currency in cls.DB.items()]
 
     @classmethod
     def get(cls, identifier):
@@ -109,6 +159,183 @@ class Currency(object):
         named_items = [(item[1].name.upper(), item[1]) for item in tuples]
         cls._LOOKUP_TABLE["name"] = dict(named_items)
 
+    @classmethod
+    def export_csv(cls, filepath):
+        """
+        Exports the currency database as a CSV file.
+        """
+        with open(filepath,"wb") as output:
+            writer = csv.DictWriter(output,
+                                    fieldnames=cls.FIELD_NAMES,
+                                    quoting=csv.QUOTE_NONNUMERIC)
+            writer.writeheader()
+            writer.writerows(cls.dictdb)
+
+    @classmethod
+    def import_csv(cls, filepath):
+        """
+        Imports a new currency database from a CSV file as a list of
+        dictionaries.
+        """
+        # Declare imported database:
+        imported = list()
+
+        with open(filepath) as input:
+            # Construct the reader:
+            reader = csv.DictReader(input,
+                                    #fieldnames=cls.FIELD_NAMES,
+                                    quoting=csv.QUOTE_NONNUMERIC)
+
+            # Iterate over items and re-parse when needed:
+            for item in reader:
+                # Ensure that the decimal points is integer:
+                item["decimal_points"] = int(item["decimal_points"]) \
+                                         if item["decimal_points"] else None
+
+                # Parse country codes list:
+                item["used_in"] = re.compile("\[\]").sub("", item["used_in"])
+                item["used_in"] = [c for c in item["used_in"].split(",")]
+
+                # Append to the imported database:
+                imported.append(item)
+
+        # Done, return the imported database:
+        return imported
+
+    @classmethod
+    def db_to_json(cls, db=None):
+        """
+        Converts the DB to json string.
+        """
+        # If no db supplied, use cls.DB:
+        db = db or cls.DB
+
+        # Generate the json string:
+        return json.dumps([item.to_simple_dict() for item in db.values()])
+
+
+class NoExchangeRateFound(Exception):
+    pass
+
+
+class ExchangeRate(object):
+    """
+    Defines an exchange rate model.
+
+    TODO: Cache may explode at some point. Take care of it!...
+    """
+
+    _PLUGINS = ["kurrency:ExchangeRate#plugin_cache"]
+    """
+    Defines a list of plugins to use when querying for exchange rates.
+    """
+
+    _CACHE = dict()
+    """
+    Defines a registry for cached rates.
+    """
+
+    def __init__(self, cur1, cur2, rate, date=None, time=None, tag=None,
+                 source=None, add_to_cache=True):
+        # Save the slots:
+        self.cur1 = cur1
+        self.cur2 = cur2
+        self.rate = Decimal(rate)
+        self.date = date or datetime.datetime.now().date()
+        self.time = time
+        self.tag = tag
+        self.source = source
+
+        # To cache or not to cache:
+        if add_to_cache:
+            self._set_to_cache(self)
+
+    @staticmethod
+    def _get_cache_key(cur1, cur2, date, time, tag, source):
+        """
+        Returns an object which is used as the cache key.
+        """
+        return (cur1, cur2, date, time, tag, source)
+
+    @classmethod
+    def _get_from_cache(cls, cur1, cur2, date, time, tag, source):
+        """
+        Returns the cached value if any, raises exception otherwise.
+        """
+        key = cls._get_cache_key(cur1, cur2, date, time, tag, source)
+        if key in cls._CACHE:
+            return cls._CACHE[key]
+        raise NoExchangeRateFound("No exchange rate found")
+
+    @classmethod
+    def _set_to_cache(cls, exchange_rate):
+        """
+        Sets the cached value of the exchange rate.
+        """
+        key = cls._get_cache_key(exchange_rate.cur1,
+                                 exchange_rate.cur2,
+                                 exchange_rate.date,
+                                 exchange_rate.time,
+                                 exchange_rate.tag,
+                                 exchange_rate.source)
+        cls._CACHE[key] = exchange_rate
+
+    @classmethod
+    def plugin_cache(cls, cur1, cur2, date=None, time=None, tag=None,
+                     source=None):
+        """
+        Retrieves the exchange rate for the currencies and date/time
+        specified.
+        """
+        return cls._get_from_cache(cur1,
+                                   cur2,
+                                   date or datetime.datetime.now().date(),
+                                   time,
+                                   tag,
+                                   source)
+
+    @classmethod
+    def get(cls, cur1, cur2, date=None, time=None, tag=None, source=None):
+        """
+        Retrieves the exchange rate for the currencies and date/time
+        specified.
+
+        TODO: Avoid repetitive imports of plugins:
+        """
+        # Create the argument array:
+        kwargs = {"cur1": cur1,
+                  "cur2": cur2,
+                  "date": date or datetime.datetime.now().date(),
+                  "time": time,
+                  "tag": tag,
+                  "source": source}
+
+        # Retrieve the callable array:
+        for plugin_path in cls._PLUGINS:
+            plugin = cls._get_callable(plugin_path)
+            try:
+                return plugin(**kwargs)
+            except NoExchangeRateFound:
+                continue
+        raise NoExchangeRateFound("No exchange rate found")
+
+    @staticmethod
+    def _get_callable(path):
+        module, ccallable = path.split(":")
+        try:
+            cls, method = ccallable.split("#")
+            return getattr(getattr(__import__(module), cls), method)
+        except ValueError:
+            return getattr(__import__(module), ccallable)
+
+    @classmethod
+    def add_plugin(cls, plugin):
+        if not plugin in cls._PLUGINS:
+            cls._PLUGINS.append(plugin)
+            return True
+        return False
+
+
 #######################
 # DATABASE POPULATION #
 #######################
@@ -120,7 +347,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "784",
-     "usage": ["AE"],
+     "used_in": [u"AE"],
      "decimals": "2",
      "common_name": "United Arab Emirates dirham",
      "nickname": ""},
@@ -130,7 +357,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "971",
-     "usage": ["AF"],
+     "used_in": ["AF"],
      "decimals": "2",
      "common_name": "Afghan afghani",
      "nickname": ""},
@@ -140,7 +367,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "008",
-     "usage": ["AL"],
+     "used_in": ["AL"],
      "decimals": "2",
      "common_name": "Albanian lek",
      "nickname": ""},
@@ -150,7 +377,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "051",
-     "usage": ["AM"],
+     "used_in": ["AM"],
      "decimals": "2",
      "common_name": "Armenian dram",
      "nickname": ""},
@@ -160,7 +387,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "532",
-     "usage": ["CW",
+     "used_in": ["CW",
                "SX"],
      "decimals": "2",
      "common_name": "Netherlands Antillean guilder",
@@ -171,7 +398,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "973",
-     "usage": ["AO"],
+     "used_in": ["AO"],
      "decimals": "2",
      "common_name": "Angolan kwanza",
      "nickname": ""},
@@ -181,7 +408,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "032",
-     "usage": ["AR"],
+     "used_in": ["AR"],
      "decimals": "2",
      "common_name": "Argentine peso",
      "nickname": ""},
@@ -191,7 +418,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "036",
-     "usage": ["AU",
+     "used_in": ["AU",
                "CX",
                "CC",
                "HM",
@@ -208,7 +435,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "533",
-     "usage": ["AW"],
+     "used_in": ["AW"],
      "decimals": "2",
      "common_name": "Aruban florin",
      "nickname": ""},
@@ -218,7 +445,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "944",
-     "usage": ["AZ"],
+     "used_in": ["AZ"],
      "decimals": "2",
      "common_name": "Azerbaijani manat",
      "nickname": ""},
@@ -228,7 +455,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "977",
-     "usage": ["BA"],
+     "used_in": ["BA"],
      "decimals": "2",
      "common_name": "Bosnia and Herzegovina convertible mark",
      "nickname": ""},
@@ -238,7 +465,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "052",
-     "usage": ["BB"],
+     "used_in": ["BB"],
      "decimals": "2",
      "common_name": "Barbados dollar",
      "nickname": ""},
@@ -248,7 +475,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "050",
-     "usage": ["BD"],
+     "used_in": ["BD"],
      "decimals": "2",
      "common_name": "Bangladeshi taka",
      "nickname": ""},
@@ -258,7 +485,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "975",
-     "usage": ["BG"],
+     "used_in": ["BG"],
      "decimals": "2",
      "common_name": "Bulgarian lev",
      "nickname": ""},
@@ -268,7 +495,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "048",
-     "usage": ["BH"],
+     "used_in": ["BH"],
      "decimals": "3",
      "common_name": "Bahraini dinar",
      "nickname": ""},
@@ -278,7 +505,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "108",
-     "usage": ["BI"],
+     "used_in": ["BI"],
      "decimals": "0",
      "common_name": "Burundian franc",
      "nickname": ""},
@@ -288,7 +515,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "060",
-     "usage": ["BM"],
+     "used_in": ["BM"],
      "decimals": "2",
      "common_name": "Bermudian dollar (customarily known as Bermuda dollar)",
      "nickname": ""},
@@ -298,7 +525,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "096",
-     "usage": ["BN",
+     "used_in": ["BN",
                "SG"],
      "decimals": "2",
      "common_name": "Brunei dollar",
@@ -309,7 +536,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "068",
-     "usage": ["BO"],
+     "used_in": ["BO"],
      "decimals": "2",
      "common_name": "Boliviano",
      "nickname": ""},
@@ -319,7 +546,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "984",
-     "usage": ["BO"],
+     "used_in": ["BO"],
      "decimals": "2",
      "common_name": "Bolivian Mvdol",
      "nickname": ""},
@@ -329,7 +556,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "986",
-     "usage": ["BR"],
+     "used_in": ["BR"],
      "decimals": "2",
      "common_name": "Brazilian real",
      "nickname": ""},
@@ -339,7 +566,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "044",
-     "usage": ["BS"],
+     "used_in": ["BS"],
      "decimals": "2",
      "common_name": "Bahamian dollar",
      "nickname": ""},
@@ -349,7 +576,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "064",
-     "usage": ["BT"],
+     "used_in": ["BT"],
      "decimals": "2",
      "common_name": "Bhutanese ngultrum",
      "nickname": ""},
@@ -359,7 +586,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "072",
-     "usage": ["BW"],
+     "used_in": ["BW"],
      "decimals": "2",
      "common_name": "Botswana pula",
      "nickname": ""},
@@ -369,7 +596,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "974",
-     "usage": ["BY"],
+     "used_in": ["BY"],
      "decimals": "0",
      "common_name": "Belarusian ruble",
      "nickname": ""},
@@ -379,7 +606,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "084",
-     "usage": ["BZ"],
+     "used_in": ["BZ"],
      "decimals": "2",
      "common_name": "Belize dollar",
      "nickname": ""},
@@ -389,7 +616,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "124",
-     "usage": ["CA"],
+     "used_in": ["CA"],
      "decimals": "2",
      "common_name": "Canadian dollar",
      "nickname": ""},
@@ -399,7 +626,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "976",
-     "usage": ["CD"],
+     "used_in": ["CD"],
      "decimals": "2",
      "common_name": "Congolese franc",
      "nickname": ""},
@@ -409,7 +636,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "947",
-     "usage": ["CH"],
+     "used_in": ["CH"],
      "decimals": "2",
      "common_name": "WIR Euro (complementary currency)",
      "nickname": ""},
@@ -419,7 +646,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "756",
-     "usage": ["CH",
+     "used_in": ["CH",
                "LI"],
      "decimals": "2",
      "common_name": "Swiss franc",
@@ -430,7 +657,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "948",
-     "usage": ["CH"],
+     "used_in": ["CH"],
      "decimals": "2",
      "common_name": "WIR Franc (complementary currency)",
      "nickname": ""},
@@ -440,7 +667,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "990",
-     "usage": ["CL"],
+     "used_in": ["CL"],
      "decimals": "0",
      "common_name": "Unidad de Fomento",
      "nickname": ""},
@@ -450,7 +677,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "152",
-     "usage": ["CL"],
+     "used_in": ["CL"],
      "decimals": "0",
      "common_name": "Chilean peso",
      "nickname": ""},
@@ -460,7 +687,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "156",
-     "usage": ["CN"],
+     "used_in": ["CN"],
      "decimals": "2",
      "common_name": "Chinese yuan",
      "nickname": ""},
@@ -470,7 +697,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "170",
-     "usage": ["CO"],
+     "used_in": ["CO"],
      "decimals": "2",
      "common_name": "Colombian peso",
      "nickname": ""},
@@ -480,7 +707,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "970",
-     "usage": ["CO"],
+     "used_in": ["CO"],
      "decimals": "2",
      "common_name": "Unidad de Valor Real",
      "nickname": ""},
@@ -490,7 +717,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "188",
-     "usage": ["CR"],
+     "used_in": ["CR"],
      "decimals": "2",
      "common_name": "Costa Rican colon",
      "nickname": ""},
@@ -500,7 +727,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "931",
-     "usage": ["CU"],
+     "used_in": ["CU"],
      "decimals": "2",
      "common_name": "Cuban convertible peso",
      "nickname": ""},
@@ -510,7 +737,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "192",
-     "usage": ["CU"],
+     "used_in": ["CU"],
      "decimals": "2",
      "common_name": "Cuban peso",
      "nickname": ""},
@@ -520,7 +747,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "132",
-     "usage": ["CV"],
+     "used_in": ["CV"],
      "decimals": "0",
      "common_name": "Cape Verde escudo",
      "nickname": ""},
@@ -530,7 +757,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "203",
-     "usage": ["CZ"],
+     "used_in": ["CZ"],
      "decimals": "2",
      "common_name": "Czech koruna",
      "nickname": ""},
@@ -540,7 +767,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "262",
-     "usage": ["DJ"],
+     "used_in": ["DJ"],
      "decimals": "0",
      "common_name": "Djiboutian franc",
      "nickname": ""},
@@ -550,7 +777,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "208",
-     "usage": ["DK",
+     "used_in": ["DK",
                "FO",
                "GL"],
      "decimals": "2",
@@ -562,7 +789,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "214",
-     "usage": ["DO"],
+     "used_in": ["DO"],
      "decimals": "2",
      "common_name": "Dominican peso",
      "nickname": ""},
@@ -572,7 +799,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "012",
-     "usage": ["DZ"],
+     "used_in": ["DZ"],
      "decimals": "2",
      "common_name": "Algerian dinar",
      "nickname": ""},
@@ -582,7 +809,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "818",
-     "usage": ["EG"],
+     "used_in": ["EG"],
      "decimals": "2",
      "common_name": "Egyptian pound",
      "nickname": ""},
@@ -592,7 +819,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "232",
-     "usage": ["ER"],
+     "used_in": ["ER"],
      "decimals": "2",
      "common_name": "Eritrean nakfa",
      "nickname": ""},
@@ -602,7 +829,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "230",
-     "usage": ["ET"],
+     "used_in": ["ET"],
      "decimals": "2",
      "common_name": "Ethiopian birr",
      "nickname": ""},
@@ -612,7 +839,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "978",
-     "usage": ["AD",
+     "used_in": ["AD",
                "AT",
                "BE",
                "CY",
@@ -644,7 +871,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "242",
-     "usage": ["FJ"],
+     "used_in": ["FJ"],
      "decimals": "2",
      "common_name": "Fiji dollar",
      "nickname": ""},
@@ -654,7 +881,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "238",
-     "usage": ["FK"],
+     "used_in": ["FK"],
      "decimals": "2",
      "common_name": "Falkland Islands pound",
      "nickname": ""},
@@ -664,7 +891,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "826",
-     "usage": ["GB",
+     "used_in": ["GB",
                "IM",
                "GS",
                "IO"],
@@ -677,7 +904,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "981",
-     "usage": ["GE"],
+     "used_in": ["GE"],
      "decimals": "2",
      "common_name": "Georgian lari",
      "nickname": ""},
@@ -687,7 +914,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "936",
-     "usage": ["GH"],
+     "used_in": ["GH"],
      "decimals": "2",
      "common_name": "Ghanaian cedi",
      "nickname": ""},
@@ -697,7 +924,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "292",
-     "usage": ["GI"],
+     "used_in": ["GI"],
      "decimals": "2",
      "common_name": "Gibraltar pound",
      "nickname": ""},
@@ -707,7 +934,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "270",
-     "usage": ["GM"],
+     "used_in": ["GM"],
      "decimals": "2",
      "common_name": "Gambian dalasi",
      "nickname": ""},
@@ -717,7 +944,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "324",
-     "usage": ["GN"],
+     "used_in": ["GN"],
      "decimals": "0",
      "common_name": "Guinean franc",
      "nickname": ""},
@@ -727,7 +954,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "320",
-     "usage": ["GT"],
+     "used_in": ["GT"],
      "decimals": "2",
      "common_name": "Guatemalan quetzal",
      "nickname": ""},
@@ -737,7 +964,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "328",
-     "usage": ["GY"],
+     "used_in": ["GY"],
      "decimals": "2",
      "common_name": "Guyanese dollar",
      "nickname": ""},
@@ -747,7 +974,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "344",
-     "usage": ["HK",
+     "used_in": ["HK",
                "MO"],
      "decimals": "2",
      "common_name": "Hong Kong dollar",
@@ -758,7 +985,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "340",
-     "usage": ["HN"],
+     "used_in": ["HN"],
      "decimals": "2",
      "common_name": "Honduran lempira",
      "nickname": ""},
@@ -768,7 +995,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "191",
-     "usage": ["HR"],
+     "used_in": ["HR"],
      "decimals": "2",
      "common_name": "Croatian kuna",
      "nickname": ""},
@@ -778,7 +1005,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "332",
-     "usage": ["HT"],
+     "used_in": ["HT"],
      "decimals": "2",
      "common_name": "Haitian gourde",
      "nickname": ""},
@@ -788,7 +1015,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "348",
-     "usage": ["HU"],
+     "used_in": ["HU"],
      "decimals": "2",
      "common_name": "Hungarian forint",
      "nickname": ""},
@@ -798,7 +1025,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "360",
-     "usage": ["ID"],
+     "used_in": ["ID"],
      "decimals": "2",
      "common_name": "Indonesian rupiah",
      "nickname": ""},
@@ -808,7 +1035,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "376",
-     "usage": ["IL",
+     "used_in": ["IL",
                "PS"],
      "decimals": "2",
      "common_name": "Israeli new sheqel",
@@ -819,7 +1046,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "356",
-     "usage": ["IN"],
+     "used_in": ["IN"],
      "decimals": "2",
      "common_name": "Indian rupee",
      "nickname": ""},
@@ -829,7 +1056,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "368",
-     "usage": ["IQ"],
+     "used_in": ["IQ"],
      "decimals": "3",
      "common_name": "Iraqi dinar",
      "nickname": ""},
@@ -839,7 +1066,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "364",
-     "usage": ["IR"],
+     "used_in": ["IR"],
      "decimals": "0",
      "common_name": "Iranian rial",
      "nickname": ""},
@@ -849,7 +1076,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "352",
-     "usage": ["IS"],
+     "used_in": ["IS"],
      "decimals": "0",
      "common_name": "Icelandic króna",
      "nickname": ""},
@@ -859,7 +1086,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "388",
-     "usage": ["JM"],
+     "used_in": ["JM"],
      "decimals": "2",
      "common_name": "Jamaican dollar",
      "nickname": ""},
@@ -869,7 +1096,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "400",
-     "usage": ["JO"],
+     "used_in": ["JO"],
      "decimals": "3",
      "common_name": "Jordanian dinar",
      "nickname": ""},
@@ -879,7 +1106,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "392",
-     "usage": ["JP"],
+     "used_in": ["JP"],
      "decimals": "0",
      "common_name": "Japanese yen",
      "nickname": ""},
@@ -889,7 +1116,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "404",
-     "usage": ["KE"],
+     "used_in": ["KE"],
      "decimals": "2",
      "common_name": "Kenyan shilling",
      "nickname": ""},
@@ -899,7 +1126,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "417",
-     "usage": ["KG"],
+     "used_in": ["KG"],
      "decimals": "2",
      "common_name": "Kyrgyzstani som",
      "nickname": ""},
@@ -909,7 +1136,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "116",
-     "usage": ["KH"],
+     "used_in": ["KH"],
      "decimals": "2",
      "common_name": "Cambodian riel",
      "nickname": ""},
@@ -919,7 +1146,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "174",
-     "usage": ["KM"],
+     "used_in": ["KM"],
      "decimals": "0",
      "common_name": "Comoro franc",
      "nickname": ""},
@@ -929,7 +1156,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "408",
-     "usage": ["KP"],
+     "used_in": ["KP"],
      "decimals": "0",
      "common_name": "North Korean won",
      "nickname": ""},
@@ -939,7 +1166,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "410",
-     "usage": ["KR"],
+     "used_in": ["KR"],
      "decimals": "0",
      "common_name": "South Korean won",
      "nickname": ""},
@@ -949,7 +1176,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "414",
-     "usage": ["KW"],
+     "used_in": ["KW"],
      "decimals": "3",
      "common_name": "Kuwaiti dinar",
      "nickname": ""},
@@ -959,7 +1186,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "136",
-     "usage": ["KY"],
+     "used_in": ["KY"],
      "decimals": "2",
      "common_name": "Cayman Islands dollar",
      "nickname": ""},
@@ -969,7 +1196,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "398",
-     "usage": ["KZ"],
+     "used_in": ["KZ"],
      "decimals": "2",
      "common_name": "Kazakhstani tenge",
      "nickname": ""},
@@ -979,7 +1206,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "418",
-     "usage": ["LA"],
+     "used_in": ["LA"],
      "decimals": "0",
      "common_name": "Lao kip",
      "nickname": ""},
@@ -989,7 +1216,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "422",
-     "usage": ["LB"],
+     "used_in": ["LB"],
      "decimals": "0",
      "common_name": "Lebanese pound",
      "nickname": ""},
@@ -999,7 +1226,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "144",
-     "usage": ["LK"],
+     "used_in": ["LK"],
      "decimals": "2",
      "common_name": "Sri Lankan rupee",
      "nickname": ""},
@@ -1009,7 +1236,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "430",
-     "usage": ["LR"],
+     "used_in": ["LR"],
      "decimals": "2",
      "common_name": "Liberian dollar",
      "nickname": ""},
@@ -1019,7 +1246,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "426",
-     "usage": ["LS"],
+     "used_in": ["LS"],
      "decimals": "2",
      "common_name": "Lesotho loti",
      "nickname": ""},
@@ -1029,7 +1256,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "440",
-     "usage": ["LT"],
+     "used_in": ["LT"],
      "decimals": "2",
      "common_name": "Lithuanian litas",
      "nickname": ""},
@@ -1039,7 +1266,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "428",
-     "usage": ["LV"],
+     "used_in": ["LV"],
      "decimals": "2",
      "common_name": "Latvian lats",
      "nickname": ""},
@@ -1049,7 +1276,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "434",
-     "usage": ["LY"],
+     "used_in": ["LY"],
      "decimals": "3",
      "common_name": "Libyan dinar",
      "nickname": ""},
@@ -1059,7 +1286,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "504",
-     "usage": ["MA"],
+     "used_in": ["MA"],
      "decimals": "2",
      "common_name": "Moroccan dirham",
      "nickname": ""},
@@ -1069,7 +1296,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "498",
-     "usage": ["MD"],
+     "used_in": ["MD"],
      "decimals": "2",
      "common_name": "Moldovan leu",
      "nickname": ""},
@@ -1079,7 +1306,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "969",
-     "usage": ["MG"],
+     "used_in": ["MG"],
      "decimals": "",
      "common_name": "Malagasy ariary",
      "nickname": ""},
@@ -1089,7 +1316,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "807",
-     "usage": ["MK"],
+     "used_in": ["MK"],
      "decimals": "2",
      "common_name": "Macedonian denar",
      "nickname": ""},
@@ -1099,7 +1326,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "104",
-     "usage": ["MM"],
+     "used_in": ["MM"],
      "decimals": "0",
      "common_name": "Myanma kyat",
      "nickname": ""},
@@ -1109,7 +1336,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "496",
-     "usage": ["MN"],
+     "used_in": ["MN"],
      "decimals": "2",
      "common_name": "Mongolian tugrik",
      "nickname": ""},
@@ -1119,7 +1346,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "446",
-     "usage": ["MO"],
+     "used_in": ["MO"],
      "decimals": "2",
      "common_name": "Macanese pataca",
      "nickname": ""},
@@ -1129,7 +1356,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "478",
-     "usage": ["MR"],
+     "used_in": ["MR"],
      "decimals": "",
      "common_name": "Mauritanian ouguiya",
      "nickname": ""},
@@ -1139,7 +1366,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "480",
-     "usage": ["MU"],
+     "used_in": ["MU"],
      "decimals": "2",
      "common_name": "Mauritian rupee",
      "nickname": ""},
@@ -1149,7 +1376,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "462",
-     "usage": ["MV"],
+     "used_in": ["MV"],
      "decimals": "2",
      "common_name": "Maldivian rufiyaa",
      "nickname": ""},
@@ -1159,7 +1386,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "454",
-     "usage": ["MW"],
+     "used_in": ["MW"],
      "decimals": "2",
      "common_name": "Malawian kwacha",
      "nickname": ""},
@@ -1169,7 +1396,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "484",
-     "usage": ["MX"],
+     "used_in": ["MX"],
      "decimals": "2",
      "common_name": "Mexican peso",
      "nickname": ""},
@@ -1179,7 +1406,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "979",
-     "usage": ["MX"],
+     "used_in": ["MX"],
      "decimals": "2",
      "common_name": "Mexican Unidad de Inversion (UDI)",
      "nickname": ""
@@ -1190,7 +1417,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "458",
-     "usage": ["MY"],
+     "used_in": ["MY"],
      "decimals": "2",
      "common_name": "Malaysian ringgit",
      "nickname": ""},
@@ -1200,7 +1427,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "943",
-     "usage": ["MZ"],
+     "used_in": ["MZ"],
      "decimals": "2",
      "common_name": "Mozambican metical",
      "nickname": ""},
@@ -1210,7 +1437,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "516",
-     "usage": ["NA"
+     "used_in": ["NA"
                ],
      "decimals": "2",
      "common_name": "Namibian dollar",
@@ -1221,7 +1448,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "566",
-     "usage": ["NG"
+     "used_in": ["NG"
                ],
      "decimals": "2",
      "common_name": "Nigerian naira",
@@ -1232,7 +1459,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "558",
-     "usage": [
+     "used_in": [
          "NI"],
      "decimals": "2",
      "common_name": "Nicaraguan córdoba",
@@ -1243,7 +1470,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "578",
-     "usage": ["NO",
+     "used_in": ["NO",
                "SJ",
                "BV"],
      "decimals": "2",
@@ -1255,7 +1482,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "524",
-     "usage": ["NP"],
+     "used_in": ["NP"],
      "decimals": "2",
      "common_name": "Nepalese rupee",
      "nickname": ""},
@@ -1265,7 +1492,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "554",
-     "usage": ["CK",
+     "used_in": ["CK",
                "NZ",
                "NU",
                "PN",
@@ -1279,7 +1506,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "512",
-     "usage": ["OM"],
+     "used_in": ["OM"],
      "decimals": "3",
      "common_name": "Omani rial",
      "nickname": ""},
@@ -1289,7 +1516,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "590",
-     "usage": ["PA"],
+     "used_in": ["PA"],
      "decimals": "2",
      "common_name": "Panamanian balboa",
      "nickname": ""},
@@ -1299,7 +1526,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "604",
-     "usage": ["PE"],
+     "used_in": ["PE"],
      "decimals": "2",
      "common_name": "Peruvian nuevo sol",
      "nickname": ""},
@@ -1309,7 +1536,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "598",
-     "usage": ["PG"],
+     "used_in": ["PG"],
      "decimals": "2",
      "common_name": "Papua New Guinean kina",
      "nickname": ""},
@@ -1319,7 +1546,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "608",
-     "usage": ["PH"],
+     "used_in": ["PH"],
      "decimals": "2",
      "common_name": "Philippine peso",
      "nickname": ""},
@@ -1329,7 +1556,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "586",
-     "usage": ["PK"],
+     "used_in": ["PK"],
      "decimals": "2",
      "common_name": "Pakistani rupee",
      "nickname": ""},
@@ -1339,7 +1566,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "985",
-     "usage": ["PL"],
+     "used_in": ["PL"],
      "decimals": "2",
      "common_name": "Polish złoty",
      "nickname": ""},
@@ -1349,7 +1576,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "600",
-     "usage": ["PY"],
+     "used_in": ["PY"],
      "decimals": "0",
      "common_name": "Paraguayan guaraní",
      "nickname": ""},
@@ -1359,7 +1586,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "634",
-     "usage": ["QA"],
+     "used_in": ["QA"],
      "decimals": "2",
      "common_name": "Qatari riyal",
      "nickname": ""},
@@ -1369,7 +1596,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "946",
-     "usage": ["RO"],
+     "used_in": ["RO"],
      "decimals": "2",
      "common_name": "Romanian new leu",
      "nickname": ""},
@@ -1379,7 +1606,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "941",
-     "usage": ["RS"],
+     "used_in": ["RS"],
      "decimals": "2",
      "common_name": "Serbian dinar",
      "nickname": ""},
@@ -1389,7 +1616,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "643",
-     "usage": ["RU"],
+     "used_in": ["RU"],
      "decimals": "2",
      "common_name": "Russian rouble",
      "nickname": ""},
@@ -1399,7 +1626,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "646",
-     "usage": ["RW"],
+     "used_in": ["RW"],
      "decimals": "0",
      "common_name": "Rwandan franc",
      "nickname": ""},
@@ -1409,7 +1636,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "682",
-     "usage": ["SA"],
+     "used_in": ["SA"],
      "decimals": "2",
      "common_name": "Saudi riyal",
      "nickname": ""},
@@ -1419,7 +1646,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "090",
-     "usage": ["SB"],
+     "used_in": ["SB"],
      "decimals": "2",
      "common_name": "Solomon Islands dollar",
      "nickname": ""},
@@ -1429,7 +1656,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "690",
-     "usage": ["SC"],
+     "used_in": ["SC"],
      "decimals": "2",
      "common_name": "Seychelles rupee",
      "nickname": ""},
@@ -1439,7 +1666,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "938",
-     "usage": ["SD"],
+     "used_in": ["SD"],
      "decimals": "2",
      "common_name": "Sudanese pound",
      "nickname": ""},
@@ -1449,7 +1676,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "752",
-     "usage": ["SE"],
+     "used_in": ["SE"],
      "decimals": "2",
      "common_name": "Swedish krona/kronor",
      "nickname": ""},
@@ -1459,7 +1686,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "702",
-     "usage": ["SG",
+     "used_in": ["SG",
                "BN"],
      "decimals": "2",
      "common_name": "Singapore dollar",
@@ -1470,7 +1697,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "654",
-     "usage": ["SH"],
+     "used_in": ["SH"],
      "decimals": "2",
      "common_name": "Saint Helena pound",
      "nickname": ""},
@@ -1480,7 +1707,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "694",
-     "usage": ["SL"],
+     "used_in": ["SL"],
      "decimals": "0",
      "common_name": "Sierra Leonean leone",
      "nickname": ""},
@@ -1490,7 +1717,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "706",
-     "usage": ["SO"],
+     "used_in": ["SO"],
      "decimals": "2",
      "common_name": "Somali shilling",
      "nickname": ""},
@@ -1500,7 +1727,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "968",
-     "usage": ["SR"],
+     "used_in": ["SR"],
      "decimals": "2",
      "common_name": "Surinamese dollar",
      "nickname": ""},
@@ -1510,7 +1737,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "728",
-     "usage": ["SS"],
+     "used_in": ["SS"],
      "decimals": "2",
      "common_name": "South Sudanese pound",
      "nickname": ""},
@@ -1520,7 +1747,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "678",
-     "usage": ["ST"],
+     "used_in": ["ST"],
      "decimals": "0",
      "common_name": "São Tomé and Príncipe dobra",
      "nickname": ""},
@@ -1530,7 +1757,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "760",
-     "usage": ["SY"],
+     "used_in": ["SY"],
      "decimals": "2",
      "common_name": "Syrian pound",
      "nickname": ""},
@@ -1540,7 +1767,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "748",
-     "usage": ["SZ"],
+     "used_in": ["SZ"],
      "decimals": "2",
      "common_name": "Swazi lilangeni",
      "nickname": ""},
@@ -1550,7 +1777,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "764",
-     "usage": ["TH"],
+     "used_in": ["TH"],
      "decimals": "2",
      "common_name": "Thai baht",
      "nickname": ""},
@@ -1560,7 +1787,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "972",
-     "usage": ["TJ"],
+     "used_in": ["TJ"],
      "decimals": "2",
      "common_name": "Tajikistani somoni",
      "nickname": ""},
@@ -1570,7 +1797,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "934",
-     "usage": ["TM"],
+     "used_in": ["TM"],
      "decimals": "2",
      "common_name": "Turkmenistani manat",
      "nickname": ""},
@@ -1580,7 +1807,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "788",
-     "usage": ["TN"],
+     "used_in": ["TN"],
      "decimals": "3",
      "common_name": "Tunisian dinar",
      "nickname": ""},
@@ -1590,7 +1817,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "776",
-     "usage": ["TO"],
+     "used_in": ["TO"],
      "decimals": "2",
      "common_name": "Tongan paʻanga",
      "nickname": ""},
@@ -1600,7 +1827,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "949",
-     "usage": ["TR"],
+     "used_in": ["TR"],
      "decimals": "2",
      "common_name": "Turkish lira",
      "nickname": ""},
@@ -1610,7 +1837,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "780",
-     "usage": ["TT"],
+     "used_in": ["TT"],
      "decimals": "2",
      "common_name": "Trinidad and Tobago dollar",
      "nickname": ""},
@@ -1620,7 +1847,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "901",
-     "usage": ["TW"],
+     "used_in": ["TW"],
      "decimals": "2",
      "common_name": "New Taiwan dollar",
      "nickname": ""},
@@ -1630,7 +1857,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "834",
-     "usage": ["TZ"],
+     "used_in": ["TZ"],
      "decimals": "2",
      "common_name": "Tanzanian shilling",
      "nickname": ""},
@@ -1640,7 +1867,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "980",
-     "usage": ["UA"],
+     "used_in": ["UA"],
      "decimals": "2",
      "common_name": "Ukrainian hryvnia",
      "nickname": ""},
@@ -1650,7 +1877,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "800",
-     "usage": ["UG"],
+     "used_in": ["UG"],
      "decimals": "2",
      "common_name": "Ugandan shilling",
      "nickname": ""},
@@ -1660,7 +1887,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "840",
-     "usage": ["AS",
+     "used_in": ["AS",
                "BB",
                "BM",
                "IO",
@@ -1688,7 +1915,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "997",
-     "usage": ["US"],
+     "used_in": ["US"],
      "decimals": "2",
      "common_name": "United States dollar (next day)",
      "nickname": ""},
@@ -1698,7 +1925,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "998",
-     "usage": ["US"],
+     "used_in": ["US"],
      "decimals": "2",
      "common_name": "United States dollar (same day)",
      "nickname": ""},
@@ -1708,7 +1935,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "940",
-     "usage": ["UY"],
+     "used_in": ["UY"],
      "decimals": "0",
      "common_name": "Uruguay Peso en Unidades Indexadas (URUIURUI)",
      "nickname": ""},
@@ -1718,7 +1945,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "858",
-     "usage": ["UY"],
+     "used_in": ["UY"],
      "decimals": "2",
      "common_name": "Uruguayan peso",
      "nickname": ""},
@@ -1728,7 +1955,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "860",
-     "usage": ["UZ"],
+     "used_in": ["UZ"],
      "decimals": "2",
      "common_name": "Uzbekistan som",
      "nickname": ""},
@@ -1738,7 +1965,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "937",
-     "usage": ["VE"],
+     "used_in": ["VE"],
      "decimals": "2",
      "common_name": "Venezuelan bolívar fuerte",
      "nickname": ""},
@@ -1748,7 +1975,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "704",
-     "usage": ["VN"],
+     "used_in": ["VN"],
      "decimals": "0",
      "common_name": "Vietname dong",
      "nickname": ""},
@@ -1758,7 +1985,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "548",
-     "usage": ["VU"],
+     "used_in": ["VU"],
      "decimals": "0",
      "common_name": "Vanuatu vatu",
      "nickname": ""},
@@ -1768,7 +1995,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "882",
-     "usage": ["WS"],
+     "used_in": ["WS"],
      "decimals": "2",
      "common_name": "Samoan tala",
      "nickname": ""},
@@ -1778,7 +2005,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "950",
-     "usage": ["CM",
+     "used_in": ["CM",
                "CF",
                "CG",
                "TD",
@@ -1793,7 +2020,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "961",
-     "usage": [],
+     "used_in": [],
      "decimals": "0",
      "common_name": "Silver (one troy ounce)",
      "nickname": ""},
@@ -1803,7 +2030,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "959",
-     "usage": [],
+     "used_in": [],
      "decimals": "0",
      "common_name": "Gold (one troy ounce)",
      "nickname": ""},
@@ -1813,7 +2040,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "955",
-     "usage": [],
+     "used_in": [],
      "decimals": "0",
      "common_name": "European Composite Unit (EURCO)",
      "nickname": ""},
@@ -1823,7 +2050,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "956",
-     "usage": [],
+     "used_in": [],
      "decimals": "0",
      "common_name": "European Monetary Unit (E.M.U.-6)",
      "nickname": ""},
@@ -1833,7 +2060,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "957",
-     "usage": [],
+     "used_in": [],
      "decimals": "0",
      "common_name": "European Unit of Account 9 (E.U.A.-9)",
      "nickname": ""},
@@ -1843,7 +2070,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "958",
-     "usage": [],
+     "used_in": [],
      "decimals": "0",
      "common_name": "European Unit of Account 17 (E.U.A.-17)",
      "nickname": ""},
@@ -1853,7 +2080,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "951",
-     "usage": ["AI",
+     "used_in": ["AI",
                "AG",
                "DM",
                "GD",
@@ -1870,7 +2097,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "960",
-     "usage": [],
+     "used_in": [],
      "decimals": "0",
      "common_name": "Special drawing rights",
      "nickname": ""},
@@ -1879,8 +2106,8 @@ RawData = [
      "short_name": "UIC franc (special settlement currency)",
      "short_symbol": "",
      "symbol": "",
-     "enum": "None",
-     "usage": [],
+     "enum": None,
+     "used_in": [],
      "decimals": "0",
      "common_name": "UIC franc (special settlement currency)",
      "nickname": ""},
@@ -1890,7 +2117,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "952",
-     "usage": ["BJ",
+     "used_in": ["BJ",
                "BF",
                "GW",
                "ML",
@@ -1906,7 +2133,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "964",
-     "usage": [],
+     "used_in": [],
      "decimals": "0",
      "common_name": "Palladium (one troy ounce)",
      "nickname": ""},
@@ -1916,7 +2143,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "953",
-     "usage": ["PF",
+     "used_in": ["PF",
                "NC",
                "WF"],
      "decimals": "0",
@@ -1928,7 +2155,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "962",
-     "usage": [],
+     "used_in": [],
      "decimals": "0",
      "common_name": "Platinum (one troy ounce)",
      "nickname": ""},
@@ -1938,7 +2165,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "963",
-     "usage": [],
+     "used_in": [],
      "decimals": "0",
      "common_name": "Code reserved for testing purposes",
      "nickname": ""},
@@ -1948,7 +2175,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "999",
-     "usage": [],
+     "used_in": [],
      "decimals": "0",
      "common_name": "No currency",
      "nickname": ""},
@@ -1958,7 +2185,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "886",
-     "usage": ["YE"],
+     "used_in": ["YE"],
      "decimals": "2",
      "common_name": "Yemeni rial",
      "nickname": ""},
@@ -1968,7 +2195,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "710",
-     "usage": ["ZA"],
+     "used_in": ["ZA"],
      "decimals": "2",
      "common_name": "South African rand",
      "nickname": ""},
@@ -1978,7 +2205,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "894",
-     "usage": ["ZM"],
+     "used_in": ["ZM"],
      "decimals": "2",
      "common_name": "Zambian kwacha",
      "nickname": ""},
@@ -1988,7 +2215,7 @@ RawData = [
      "short_symbol": "",
      "symbol": "",
      "enum": "932",
-     "usage": ["ZW"],
+     "used_in": ["ZW"],
      "decimals": "2",
      "common_name": "Zimbabwe dollar",
      "nickname": ""}]
@@ -2003,5 +2230,5 @@ Currency.put(*[Currency(currency["code"],
                         currency["symbol"],
                         currency["short_symbol"],
                         currency["decimals"],
-                        [Country.get(code) for code in currency["usage"]])
+                        [Country.get(code) for code in currency["used_in"]])
                for currency in RawData])
