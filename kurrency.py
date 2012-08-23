@@ -37,6 +37,7 @@ from textwrap import wrap
 import csv
 import datetime
 import json
+import logging
 import re
 
 class Currency(object):
@@ -77,7 +78,7 @@ class Currency(object):
         self.used_in = used_in
 
     def __repr__(self):
-        return self.name
+        return self.code
 
     def to_dict(self):
         """
@@ -245,17 +246,56 @@ class ExchangeRate(object):
         self.time = time
         self.tag = tag
         self.source = source
+        self.add_to_cache = add_to_cache
 
         # To cache or not to cache:
         if add_to_cache:
             self._set_to_cache(self)
 
+    def to_dict(self):
+        return {"cur1": self.cur1,
+                "cur2": self.cur2,
+                "rate": self.rate,
+                "date": self.date,
+                "time": self.time,
+                "tag": self.tag,
+                "source": self.source}
+
+    def to_simple_dict(self):
+        return {"cur1": self.cur1.code,
+                "cur2": self.cur2.code,
+                "rate": str(self.rate),
+                "date": str(self.date),
+                "time": self.time,
+                "tag": self.tag,
+                "source": self.source}
+
+    def revert(self):
+        return ExchangeRate(
+            cur1=self.cur2,
+            cur2=self.cur1,
+            rate=Decimal("1") / self.rate,
+            date=self.date,
+            time=self.time,
+            tag=self.tag,
+            source=self.source,
+            add_to_cache=self.add_to_cache)
+
     @staticmethod
     def _get_cache_key(cur1, cur2, date, time, tag, source):
         """
         Returns an object which is used as the cache key.
+
+        Please note that the source is ignored.
         """
-        return (cur1, cur2, date, time, tag, source)
+        cur1 = cur1.code if isinstance(cur1, Currency) else cur1
+        cur2 = cur2.code if isinstance(cur2, Currency) else cur2
+        date = date if isinstance(date, str) else str(date)
+        time = time if isinstance(time, str) else str(time)
+        tag = tag if isinstance(tag, str) else str(tag)
+        source = source if isinstance(source, str) else str(source)
+        key = "#".join([cur1, cur2, date, time, tag])
+        return key
 
     @classmethod
     def _get_from_cache(cls, cur1, cur2, date, time, tag, source):
@@ -295,7 +335,8 @@ class ExchangeRate(object):
                                    source)
 
     @classmethod
-    def get(cls, cur1, cur2, date=None, time=None, tag=None, source=None):
+    def get(cls, cur1, cur2, date=None, time=None, tag=None, source=None,
+            reverse=False):
         """
         Retrieves the exchange rate for the currencies and date/time
         specified.
@@ -319,7 +360,23 @@ class ExchangeRate(object):
             try:
                 return plugin(**kwargs)
             except NoExchangeRateFound:
+                logging.debug("Plugin %s failed" % (plugin_path,))
                 continue
+
+        # Still could not find a rate. So, find the reverse rate if we
+        # are told so:
+        if reverse:
+            # Swap currencies:
+            swap = kwargs["cur1"]
+            kwargs["cur1"] = kwargs["cur2"]
+            kwargs["cur2"] = swap
+
+            # Ensure non-finite recursion:
+            kwargs["reverse"] = False
+
+            # Get, revert and return:
+            return ExchangeRate.get(**kwargs).revert()
+
         raise NoExchangeRateFound("No exchange rate found")
 
     @staticmethod
